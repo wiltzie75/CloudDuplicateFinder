@@ -20,14 +20,16 @@ Optional (for image thumbnails in Tab 1):
 
 import os
 import sys
+import json
 import sqlite3
 import hashlib
 import subprocess
 import threading
 import queue
+import webbrowser
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 
 try:
     from PIL import Image, ImageTk
@@ -41,6 +43,14 @@ try:
 except ImportError:
     pass
 
+try:
+    import dropbox
+    from dropbox.oauth import DropboxOAuth2FlowNoRedirect
+    from dropbox.files import FileMetadata
+    DROPBOX_AVAILABLE = True
+except ImportError:
+    DROPBOX_AVAILABLE = False
+
 HOME = Path.home()
 SKIP_DIR_NAMES = {".git", "node_modules", ".Trash", ".Trashes", ".Spotlight-V100"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".heic", ".heif", ".webp"}
@@ -49,6 +59,11 @@ RAW_EXTS = {".cr2", ".cr3", ".nef", ".nrw", ".arw", ".dng", ".raf", ".orf",
 PHOTO_EXTS = IMAGE_EXTS | RAW_EXTS
 DUP_SCAN_EXTS = {".heic", ".jpg", ".jpeg", ".png"}
 THUMB_SIZE = (48, 48)
+
+# Dropbox app (public client identifier from the Dropbox App Console — not a
+# secret). PKCE is used for auth, so no app secret is stored anywhere.
+DROPBOX_APP_KEY = "qkydu85wo266x5g"
+CONFIG_PATH = HOME / ".cloud_duplicate_finder.json"
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +263,88 @@ def move_to_trash(path):
 
 
 # ---------------------------------------------------------------------------
+# Config + Dropbox (online) helpers
+# ---------------------------------------------------------------------------
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.chmod(CONFIG_PATH, 0o600)  # readable only by this user (holds a token)
+    except OSError:
+        pass
+
+
+def make_dropbox_client(config):
+    """Build a Dropbox client from a stored refresh token, or None if not connected."""
+    if not DROPBOX_AVAILABLE:
+        return None
+    refresh = config.get("dropbox_refresh_token")
+    if not refresh:
+        return None
+    app_key = config.get("dropbox_app_key") or DROPBOX_APP_KEY
+    return dropbox.Dropbox(oauth2_refresh_token=refresh, app_key=app_key)
+
+
+def list_dropbox_files(dbx, progress_cb=None, stop_flag=None):
+    """Return a list of (path_display, size, content_hash) for every file in Dropbox."""
+    files = []
+    result = dbx.files_list_folder("", recursive=True)
+    while True:
+        for entry in result.entries:
+            if isinstance(entry, FileMetadata):
+                files.append((entry.path_display, entry.size, entry.content_hash))
+        if progress_cb:
+            progress_cb(f"Listed {len(files)} files...")
+        if stop_flag and stop_flag.is_set():
+            return None
+        if not result.has_more:
+            break
+        result = dbx.files_list_folder_continue(result.cursor)
+    return files
+
+
+def find_dropbox_duplicates(dbx, progress_cb=None, stop_flag=None):
+    """Group Dropbox files by Dropbox's own content_hash to find exact duplicates.
+
+    No file contents are downloaded — content_hash is provided in the metadata.
+    """
+    files = list_dropbox_files(dbx, progress_cb=progress_cb, stop_flag=stop_flag)
+    if files is None:
+        return None
+
+    hash_map = {}
+    for path, size, chash in files:
+        if not chash or size == 0:
+            continue
+        hash_map.setdefault(chash, []).append((path, size))
+
+    dup_groups = []
+    for chash, items in hash_map.items():
+        if len(items) < 2:
+            continue
+        items.sort()
+        size = items[0][1]
+        wasted = size * (len(items) - 1)
+        dup_groups.append({
+            "size": size,
+            "files": [p for p, _ in items],
+            "wasted": wasted,
+        })
+
+    dup_groups.sort(key=lambda g: g["wasted"], reverse=True)
+    return dup_groups, len(files)
+
+
+# ---------------------------------------------------------------------------
 # Capture One cross-reference helpers
 # ---------------------------------------------------------------------------
 
@@ -391,9 +488,25 @@ class App(tk.Tk):
         self.custom_catalog_roots = []
         self.cross_ref_result = None
 
+        self.dbx_queue = queue.Queue()
+        self.dbx_stop_flag = threading.Event()
+        self.config_data = load_config()
+        self.dbx_flow = None
+        self.dbx_dup_groups = []
+
         style = ttk.Style(self)
+        # Prefer macOS's native 'aqua' theme, but only when running as a bundled
+        # .app (the launcher sets CDF_BUNDLED=1). As a loose script, aqua's
+        # native buttons can be unresponsive to clicks because the process isn't
+        # activated as a real app, so we fall back to 'clam' for reliability.
+        bundled = os.environ.get("CDF_BUNDLED") == "1"
+        tk_major = int(self.tk.call("info", "patchlevel").split(".")[0])
+        if bundled and tk_major >= 9 and "aqua" in style.theme_names():
+            theme = "aqua"
+        else:
+            theme = "clam"
         try:
-            style.theme_use("clam")  # macOS's native 'aqua' theme ignores rowheight, breaking thumbnails
+            style.theme_use(theme)
         except tk.TclError:
             pass
         style.configure("Treeview", rowheight=56)
@@ -403,14 +516,39 @@ class App(tk.Tk):
 
         tab_dup = ttk.Frame(notebook)
         tab_c1 = ttk.Frame(notebook)
+        tab_dbx = ttk.Frame(notebook)
         notebook.add(tab_dup, text="Duplicate Finder")
         notebook.add(tab_c1, text="Capture One Cross-Reference")
+        notebook.add(tab_dbx, text="Dropbox (Online)")
 
         self._build_dup_tab(tab_dup)
         self._build_c1_tab(tab_c1)
+        self._build_dropbox_tab(tab_dbx)
+        self._build_menubar()
 
         self.after(150, self._poll_queue)
         self.after(150, self._poll_c1_queue)
+        self.after(150, self._poll_dbx_queue)
+
+    # ---- native macOS menu bar -------------------------------------------
+
+    def _build_menubar(self):
+        menubar = tk.Menu(self)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(
+            label="Scan for Duplicates", command=self._start_scan, accelerator="Cmd+R"
+        )
+        file_menu.add_command(
+            label="Add Custom Folder…", command=self._add_custom, accelerator="Cmd+O"
+        )
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        # Keyboard shortcuts (macOS Command key)
+        self.bind_all("<Command-r>", lambda e: self._start_scan())
+        self.bind_all("<Command-o>", lambda e: self._add_custom())
+
+        self.config(menu=menubar)
 
     # ---- shared tree selection helper ------------------------------------
 
