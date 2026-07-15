@@ -27,6 +27,9 @@ import subprocess
 import threading
 import queue
 import webbrowser
+import urllib.parse
+import urllib.request
+import io
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
@@ -51,6 +54,15 @@ try:
 except ImportError:
     DROPBOX_AVAILABLE = False
 
+try:
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.oauth2.credentials import Credentials as GoogleCredentials
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    from googleapiclient.discovery import build as google_build
+    GOOGLE_AVAILABLE = True
+except ImportError:
+    GOOGLE_AVAILABLE = False
+
 HOME = Path.home()
 SKIP_DIR_NAMES = {".git", "node_modules", ".Trash", ".Trashes", ".Spotlight-V100"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".heic", ".heif", ".webp"}
@@ -62,8 +74,15 @@ THUMB_SIZE = (48, 48)
 
 # Dropbox app (public client identifier from the Dropbox App Console — not a
 # secret). PKCE is used for auth, so no app secret is stored anywhere.
-DROPBOX_APP_KEY = "qkydu85wo266x5g"
+DROPBOX_APP_KEY = "uv9k0h9v3wrrgvp"
 CONFIG_PATH = HOME / ".cloud_duplicate_finder.json"
+
+# Google's own OAuth client for "Desktop app" credentials isn't treated as
+# confidential (Google's docs: installed apps can't keep it secret), but it's
+# still kept out of this file and out of the checked-in project — each user
+# downloads their own from Google Cloud Console and it lives in their home dir.
+GOOGLE_CLIENT_SECRET_PATH = HOME / ".cloud_duplicate_finder_google_client.json"
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
 # ---------------------------------------------------------------------------
@@ -295,12 +314,12 @@ def make_dropbox_client(config):
 
 
 def list_dropbox_files(dbx, progress_cb=None, stop_flag=None):
-    """Return a list of (path_display, size, content_hash) for every file in Dropbox."""
+    """Return a list of (path_display, size, content_hash) for every .jpg/.jpeg/.heic/.png file in Dropbox."""
     files = []
     result = dbx.files_list_folder("", recursive=True)
     while True:
         for entry in result.entries:
-            if isinstance(entry, FileMetadata):
+            if isinstance(entry, FileMetadata) and Path(entry.path_display).suffix.lower() in DUP_SCAN_EXTS:
                 files.append((entry.path_display, entry.size, entry.content_hash))
         if progress_cb:
             progress_cb(f"Listed {len(files)} files...")
@@ -342,6 +361,184 @@ def find_dropbox_duplicates(dbx, progress_cb=None, stop_flag=None):
 
     dup_groups.sort(key=lambda g: g["wasted"], reverse=True)
     return dup_groups, len(files)
+
+
+def download_dropbox_thumbnail(dbx, path, size=THUMB_SIZE):
+    """Fetch and resize a small preview image for a Dropbox file, or return None on failure."""
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        _, response = dbx.files_get_thumbnail_v2(
+            dropbox.files.PathOrLink.path(path),
+            format=dropbox.files.ThumbnailFormat.jpeg,
+            size=dropbox.files.ThumbnailSize.w128h128,
+        )
+        img = Image.open(io.BytesIO(response.content))
+        img.thumbnail(size)
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def attach_dropbox_thumbnails(dbx, dup_groups, progress_cb=None, stop_flag=None):
+    """Replace each group's plain path list with (path, thumbnail PNG bytes-or-None) pairs."""
+    count = 0
+    total = sum(len(g["files"]) for g in dup_groups)
+    for group in dup_groups:
+        new_files = []
+        for path in group["files"]:
+            if stop_flag and stop_flag.is_set():
+                return None
+            thumb_bytes = download_dropbox_thumbnail(dbx, path)
+            new_files.append((path, thumb_bytes))
+            count += 1
+            if progress_cb and count % 20 == 0:
+                progress_cb(f"Fetched {count}/{total} thumbnails...")
+        group["files"] = new_files
+    return dup_groups
+
+
+# ---------------------------------------------------------------------------
+# Config + Google Drive (online) helpers
+# ---------------------------------------------------------------------------
+
+def make_google_credentials(config):
+    """Build Google OAuth credentials from a stored refresh token, or None if not connected."""
+    if not GOOGLE_AVAILABLE:
+        return None
+    refresh = config.get("google_refresh_token")
+    if not refresh or not GOOGLE_CLIENT_SECRET_PATH.exists():
+        return None
+    try:
+        with open(GOOGLE_CLIENT_SECRET_PATH) as f:
+            client_info = json.load(f)["installed"]
+    except (OSError, ValueError, KeyError):
+        return None
+    return GoogleCredentials(
+        None,
+        refresh_token=refresh,
+        client_id=client_info["client_id"],
+        client_secret=client_info["client_secret"],
+        token_uri=client_info["token_uri"],
+        scopes=GOOGLE_SCOPES,
+    )
+
+
+def make_google_drive_service(config):
+    """Build a Google Drive API client from a stored refresh token, or None if not connected."""
+    creds = make_google_credentials(config)
+    if creds is None:
+        return None
+    return google_build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def list_google_drive_files(service, progress_cb=None, stop_flag=None):
+    """Return (file_id, name, size, md5Checksum, thumbnailLink) for every .jpg/.jpeg/.heic/.png file
+    with a checksum.
+
+    Native Google Docs/Sheets/Slides have no md5Checksum and are skipped — there's
+    no byte content to compare for those.
+    """
+    files = []
+    page_token = None
+    while True:
+        if stop_flag and stop_flag.is_set():
+            return None
+        response = service.files().list(
+            q="trashed = false",
+            fields="nextPageToken, files(id, name, size, md5Checksum, thumbnailLink)",
+            pageSize=1000,
+            pageToken=page_token,
+        ).execute()
+        for f in response.get("files", []):
+            if Path(f["name"]).suffix.lower() not in DUP_SCAN_EXTS:
+                continue
+            md5 = f.get("md5Checksum")
+            size = f.get("size")
+            if md5 and size:
+                files.append((f["id"], f["name"], int(size), md5, f.get("thumbnailLink")))
+        if progress_cb:
+            progress_cb(f"Listed {len(files)} files...")
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
+def find_google_drive_duplicates(service, progress_cb=None, stop_flag=None):
+    """Group Google Drive files by Google's own md5Checksum to find exact duplicates.
+
+    No file contents are downloaded — md5Checksum is provided in the metadata.
+    """
+    files = list_google_drive_files(service, progress_cb=progress_cb, stop_flag=stop_flag)
+    if files is None:
+        return None
+
+    hash_map = {}
+    for file_id, name, size, md5, thumb_link in files:
+        hash_map.setdefault(md5, []).append((file_id, name, size, thumb_link))
+
+    dup_groups = []
+    for md5, items in hash_map.items():
+        if len(items) < 2:
+            continue
+        items.sort(key=lambda x: x[1])
+        size = items[0][2]
+        wasted = size * (len(items) - 1)
+        dup_groups.append({
+            "size": size,
+            "files": [(fid, name, thumb_link) for fid, name, _, thumb_link in items],
+            "wasted": wasted,
+        })
+
+    dup_groups.sort(key=lambda g: g["wasted"], reverse=True)
+    return dup_groups, len(files)
+
+
+def download_google_drive_thumbnail(creds, thumbnail_link, size=THUMB_SIZE):
+    """Fetch and resize a Drive file's small preview image, or return None on failure.
+
+    Uses the thumbnailLink from the file's metadata — a small preview, not the full file.
+    """
+    if not thumbnail_link or not PIL_AVAILABLE:
+        return None
+    try:
+        if not creds.valid:
+            creds.refresh(GoogleAuthRequest())
+        req = urllib.request.Request(thumbnail_link, headers={"Authorization": f"Bearer {creds.token}"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+        img = Image.open(io.BytesIO(raw))
+        img.thumbnail(size)
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def attach_google_drive_thumbnails(creds, dup_groups, progress_cb=None, stop_flag=None):
+    """Replace each file's thumbnailLink with downloaded+resized thumbnail PNG bytes (or None)."""
+    count = 0
+    total = sum(len(g["files"]) for g in dup_groups)
+    for group in dup_groups:
+        new_files = []
+        for file_id, name, thumb_link in group["files"]:
+            if stop_flag and stop_flag.is_set():
+                return None
+            thumb_bytes = download_google_drive_thumbnail(creds, thumb_link)
+            new_files.append((file_id, name, thumb_bytes))
+            count += 1
+            if progress_cb and count % 20 == 0:
+                progress_cb(f"Fetched {count}/{total} thumbnails...")
+        group["files"] = new_files
+    return dup_groups
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +690,13 @@ class App(tk.Tk):
         self.config_data = load_config()
         self.dbx_flow = None
         self.dbx_dup_groups = []
+        self._dbx_thumb_refs = []  # keep PhotoImage references alive
+
+        self.gdrive_queue = queue.Queue()
+        self.gdrive_stop_flag = threading.Event()
+        self.gdrive_dup_groups = []
+        self.gdrive_item_info = {}
+        self._gdrive_thumb_refs = []  # keep PhotoImage references alive
 
         style = ttk.Style(self)
         # Prefer macOS's native 'aqua' theme, but only when running as a bundled
@@ -517,18 +721,22 @@ class App(tk.Tk):
         tab_dup = ttk.Frame(notebook)
         tab_c1 = ttk.Frame(notebook)
         tab_dbx = ttk.Frame(notebook)
+        tab_gdrive = ttk.Frame(notebook)
         notebook.add(tab_dup, text="Duplicate Finder")
         notebook.add(tab_c1, text="Capture One Cross-Reference")
         notebook.add(tab_dbx, text="Dropbox (Online)")
+        notebook.add(tab_gdrive, text="Google Drive (Online)")
 
         self._build_dup_tab(tab_dup)
         self._build_c1_tab(tab_c1)
         self._build_dropbox_tab(tab_dbx)
+        self._build_gdrive_tab(tab_gdrive)
         self._build_menubar()
 
         self.after(150, self._poll_queue)
         self.after(150, self._poll_c1_queue)
         self.after(150, self._poll_dbx_queue)
+        self.after(150, self._poll_gdrive_queue)
 
     # ---- native macOS menu bar -------------------------------------------
 
@@ -1124,6 +1332,626 @@ class App(tk.Tk):
             messagebox.showerror("Some files failed", "\n".join(errors[:10]))
         else:
             messagebox.showinfo("Done", f"Moved {len(succeeded)} photo(s) to Trash.")
+
+
+    # =======================================================================
+    # TAB 3: Dropbox (Online)
+    # =======================================================================
+
+    def _build_dropbox_tab(self, parent):
+        top = ttk.Frame(parent, padding=10)
+        top.pack(fill="x")
+
+        ttk.Label(
+            top, text="Connect your Dropbox account", font=("", 12, "bold")
+        ).pack(anchor="w")
+        ttk.Label(
+            top,
+            text=("Scans your entire Dropbox online for .jpg, .jpeg, .heic, and .png files, including "
+                  "files not synced to this Mac. Duplicates are found using Dropbox's own content hash, "
+                  "so nothing is downloaded."),
+            foreground="gray", wraplength=900, justify="left"
+        ).pack(anchor="w")
+
+        if not DROPBOX_AVAILABLE:
+            ttk.Label(
+                top,
+                text="Requires the 'dropbox' package. Run: pip3 install dropbox — then restart the app.",
+                foreground="gray"
+            ).pack(anchor="w", pady=(4, 0))
+
+        conn_frame = ttk.Frame(top)
+        conn_frame.pack(fill="x", pady=(8, 0))
+        self.dbx_connect_btn = ttk.Button(
+            conn_frame, text="Connect Dropbox...", command=self._connect_dropbox
+        )
+        self.dbx_connect_btn.pack(side="left")
+        self.dbx_disconnect_btn = ttk.Button(
+            conn_frame, text="Disconnect", command=self._disconnect_dropbox, state="disabled"
+        )
+        self.dbx_disconnect_btn.pack(side="left", padx=10)
+
+        self.dbx_status_var = tk.StringVar(value="Not connected.")
+        ttk.Label(top, textvariable=self.dbx_status_var).pack(anchor="w", pady=(8, 0))
+
+        ttk.Separator(top).pack(fill="x", pady=10)
+
+        scan_frame = ttk.Frame(top)
+        scan_frame.pack(fill="x")
+        self.dbx_scan_btn = ttk.Button(
+            scan_frame, text="Scan Dropbox for Duplicates", command=self._start_dropbox_scan, state="disabled"
+        )
+        self.dbx_scan_btn.pack(side="left")
+        self.dbx_cancel_btn = ttk.Button(
+            scan_frame, text="Cancel", command=self._cancel_dropbox_scan, state="disabled"
+        )
+        self.dbx_cancel_btn.pack(side="left", padx=10)
+
+        self.dbx_summary_var = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.dbx_summary_var, font=("", 11, "bold")).pack(anchor="w", pady=(8, 0))
+
+        mid = ttk.Frame(parent, padding=(10, 0, 10, 10))
+        mid.pack(fill="both", expand=True)
+
+        self.dbx_tree = ttk.Treeview(
+            mid, columns=("path", "size"), show="tree headings", selectmode="extended"
+        )
+        self.dbx_tree.heading("#0", text="Duplicate Group")
+        self.dbx_tree.heading("path", text="Dropbox Path")
+        self.dbx_tree.heading("size", text="Size")
+        self.dbx_tree.column("#0", width=320)
+        self.dbx_tree.column("path", width=460)
+        self.dbx_tree.column("size", width=100, anchor="e")
+        self.dbx_tree.pack(side="left", fill="both", expand=True)
+
+        dbx_scrollbar = ttk.Scrollbar(mid, orient="vertical", command=self.dbx_tree.yview)
+        dbx_scrollbar.pack(side="right", fill="y")
+        self.dbx_tree.configure(yscrollcommand=dbx_scrollbar.set)
+
+        bottom = ttk.Frame(parent, padding=10)
+        bottom.pack(fill="x")
+        ttk.Button(
+            bottom, text="View in Dropbox.com",
+            command=lambda: self._view_dropbox_paths(self._get_selected_files(self.dbx_tree))
+        ).pack(side="left")
+        ttk.Button(
+            bottom, text="Delete Selected from Dropbox", command=self._delete_selected_dropbox
+        ).pack(side="left", padx=10)
+
+        self._update_dropbox_status()
+
+    def _connect_dropbox(self):
+        if not DROPBOX_AVAILABLE:
+            messagebox.showerror(
+                "Dropbox package not installed",
+                "Run: pip3 install dropbox\nThen restart the app."
+            )
+            return
+
+        flow = DropboxOAuth2FlowNoRedirect(DROPBOX_APP_KEY, use_pkce=True, token_access_type="offline")
+        try:
+            authorize_url = flow.start()
+        except Exception as e:
+            messagebox.showerror("Error starting authorization", str(e))
+            return
+
+        self.dbx_flow = flow
+        webbrowser.open(authorize_url)
+        code = simpledialog.askstring(
+            "Dropbox Authorization",
+            "A browser window opened to Dropbox's authorization page.\n\n"
+            "1. Click Allow.\n"
+            "2. Copy the code Dropbox shows you.\n"
+            "3. Paste it below:",
+            parent=self,
+        )
+        self.dbx_flow = None
+        if not code:
+            return
+
+        try:
+            result = flow.finish(code.strip())
+        except Exception as e:
+            messagebox.showerror("Authorization failed", str(e))
+            return
+
+        self.config_data["dropbox_refresh_token"] = result.refresh_token
+        save_config(self.config_data)
+        self._update_dropbox_status()
+
+    def _disconnect_dropbox(self):
+        confirm = messagebox.askyesno(
+            "Disconnect Dropbox", "Remove the stored Dropbox connection from this app?"
+        )
+        if not confirm:
+            return
+        self.config_data.pop("dropbox_refresh_token", None)
+        save_config(self.config_data)
+        self.dbx_dup_groups = []
+        self.dbx_tree.delete(*self.dbx_tree.get_children())
+        self.dbx_summary_var.set("")
+        self._update_dropbox_status()
+
+    def _update_dropbox_status(self):
+        dbx = make_dropbox_client(self.config_data)
+        if dbx is None:
+            self.dbx_status_var.set("Not connected.")
+            self.dbx_connect_btn.config(text="Connect Dropbox...")
+            self.dbx_scan_btn.config(state="disabled")
+            self.dbx_disconnect_btn.config(state="disabled")
+            return
+
+        self.dbx_scan_btn.config(state="normal")
+        self.dbx_disconnect_btn.config(state="normal")
+        self.dbx_connect_btn.config(text="Reconnect Dropbox...")
+        self.dbx_status_var.set("Connected — checking account...")
+
+        def worker():
+            try:
+                acct = dbx.users_get_current_account()
+                self.dbx_queue.put(("account", acct.email))
+            except Exception as e:
+                self.dbx_queue.put(("account_error", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_dropbox_scan(self):
+        dbx = make_dropbox_client(self.config_data)
+        if dbx is None:
+            messagebox.showwarning("Not connected", "Connect your Dropbox account first.")
+            return
+
+        self.dbx_stop_flag.clear()
+        self.dbx_scan_btn.config(state="disabled")
+        self.dbx_cancel_btn.config(state="normal")
+        self.dbx_status_var.set("Scanning Dropbox... this can take a while for large accounts.")
+        self.dbx_tree.delete(*self.dbx_tree.get_children())
+        self._dbx_thumb_refs.clear()
+        self.dbx_summary_var.set("")
+
+        def progress(msg):
+            self.dbx_queue.put(("progress", msg))
+
+        def worker():
+            result = find_dropbox_duplicates(dbx, progress_cb=progress, stop_flag=self.dbx_stop_flag)
+            if result is not None:
+                dup_groups, total_listed = result
+                dup_groups = attach_dropbox_thumbnails(
+                    dbx, dup_groups, progress_cb=progress, stop_flag=self.dbx_stop_flag
+                )
+                result = None if dup_groups is None else (dup_groups, total_listed)
+            self.dbx_queue.put(("scan_done", result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cancel_dropbox_scan(self):
+        self.dbx_stop_flag.set()
+        self.dbx_status_var.set("Cancelling...")
+
+    def _poll_dbx_queue(self):
+        try:
+            while True:
+                kind, payload = self.dbx_queue.get_nowait()
+                if kind == "progress":
+                    self.dbx_status_var.set(payload)
+                elif kind == "scan_done":
+                    self._on_dropbox_scan_done(payload)
+                elif kind == "account":
+                    self.dbx_status_var.set(f"Connected as {payload}.")
+                elif kind == "account_error":
+                    self.dbx_status_var.set(f"Connected, but couldn't verify account: {payload}")
+                elif kind == "delete_done":
+                    self._on_dropbox_delete_done(payload)
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_dbx_queue)
+
+    def _on_dropbox_scan_done(self, result):
+        self.dbx_scan_btn.config(state="normal")
+        self.dbx_cancel_btn.config(state="disabled")
+        if result is None:
+            self.dbx_status_var.set("Scan cancelled.")
+            return
+
+        dup_groups, total_listed = result
+        self.dbx_dup_groups = dup_groups
+        total_wasted = sum(g["wasted"] for g in dup_groups)
+        self.dbx_status_var.set(f"Scan complete — {total_listed} files listed.")
+        self.dbx_summary_var.set(
+            f"{len(dup_groups)} duplicate groups found — {human_size(total_wasted)} of wasted space"
+        )
+
+        for group in dup_groups:
+            label = (
+                f"{human_size(group['size'])} x {len(group['files'])} copies "
+                f"— wastes {human_size(group['wasted'])}"
+            )
+            group_id = self.dbx_tree.insert("", "end", text=label, open=False, tags=("group",))
+            for path, thumb_bytes in group["files"]:
+                kwargs = dict(text="", values=(path, human_size(group["size"])), tags=("file",))
+                if thumb_bytes is not None:
+                    try:
+                        thumb = ImageTk.PhotoImage(Image.open(io.BytesIO(thumb_bytes)))
+                        self._dbx_thumb_refs.append(thumb)
+                        kwargs["image"] = thumb
+                    except Exception:
+                        pass
+                self.dbx_tree.insert(group_id, "end", **kwargs)
+
+    def _view_dropbox_paths(self, paths):
+        if not paths:
+            messagebox.showinfo("Nothing selected", "Select one or more files first.")
+            return
+        for p in paths[:10]:
+            webbrowser.open("https://www.dropbox.com/home" + urllib.parse.quote(p))
+
+    def _delete_selected_dropbox(self):
+        paths = self._get_selected_files(self.dbx_tree)
+        if not paths:
+            messagebox.showinfo("Nothing selected", "Select one or more duplicate files to delete.")
+            return
+        dbx = make_dropbox_client(self.config_data)
+        if dbx is None:
+            messagebox.showwarning("Not connected", "Connect your Dropbox account first.")
+            return
+        confirm = messagebox.askyesno(
+            "Confirm",
+            f"Delete {len(paths)} file(s) from Dropbox?\n\n"
+            f"This uses Dropbox's own deleted-files history, so it's recoverable from dropbox.com "
+            f"for a limited time (30+ days depending on your plan)."
+        )
+        if not confirm:
+            return
+
+        self.dbx_status_var.set(f"Deleting {len(paths)} file(s) from Dropbox...")
+
+        def worker():
+            errors = []
+            succeeded = []
+            for p in paths:
+                try:
+                    dbx.files_delete_v2(p)
+                    succeeded.append(p)
+                except Exception as e:
+                    errors.append(f"{p}: {e}")
+            self.dbx_queue.put(("delete_done", (succeeded, errors)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_dropbox_delete_done(self, payload):
+        succeeded, errors = payload
+        succeeded_set = set(succeeded)
+        for item in list(self.dbx_tree.selection()):
+            if self.dbx_tree.tag_has("file", item):
+                values = self.dbx_tree.item(item, "values")
+                if values and values[0] in succeeded_set:
+                    self.dbx_tree.delete(item)
+
+        self.dbx_status_var.set(f"Deleted {len(succeeded)} file(s) from Dropbox.")
+        if errors:
+            messagebox.showerror("Some files failed", "\n".join(errors[:10]))
+
+    # =======================================================================
+    # TAB 4: Google Drive (Online)
+    # =======================================================================
+
+    def _build_gdrive_tab(self, parent):
+        top = ttk.Frame(parent, padding=10)
+        top.pack(fill="x")
+
+        ttk.Label(
+            top, text="Connect your Google Drive account", font=("", 12, "bold")
+        ).pack(anchor="w")
+        ttk.Label(
+            top,
+            text=("Scans your entire Drive online for .jpg, .jpeg, .heic, and .png files, including files "
+                  "not synced to this Mac. Duplicates are found using Google's own file checksum — full "
+                  "files aren't downloaded, only small thumbnail previews for files with duplicates."),
+            foreground="gray", wraplength=900, justify="left"
+        ).pack(anchor="w")
+
+        if not GOOGLE_AVAILABLE:
+            ttk.Label(
+                top,
+                text=("Requires the Google API packages. Run: pip3 install google-api-python-client "
+                      "google-auth-oauthlib google-auth-httplib2 — then restart the app."),
+                foreground="gray"
+            ).pack(anchor="w", pady=(4, 0))
+        elif not GOOGLE_CLIENT_SECRET_PATH.exists():
+            ttk.Label(
+                top,
+                text=(f"Missing OAuth client file. Download it from Google Cloud Console "
+                      f"(APIs & Services -> Credentials) and save it as:\n{GOOGLE_CLIENT_SECRET_PATH}"),
+                foreground="gray", wraplength=900, justify="left"
+            ).pack(anchor="w", pady=(4, 0))
+
+        conn_frame = ttk.Frame(top)
+        conn_frame.pack(fill="x", pady=(8, 0))
+        self.gdrive_connect_btn = ttk.Button(
+            conn_frame, text="Connect Google Drive...", command=self._connect_google_drive
+        )
+        self.gdrive_connect_btn.pack(side="left")
+        self.gdrive_disconnect_btn = ttk.Button(
+            conn_frame, text="Disconnect", command=self._disconnect_google_drive, state="disabled"
+        )
+        self.gdrive_disconnect_btn.pack(side="left", padx=10)
+
+        self.gdrive_status_var = tk.StringVar(value="Not connected.")
+        ttk.Label(top, textvariable=self.gdrive_status_var).pack(anchor="w", pady=(8, 0))
+
+        ttk.Separator(top).pack(fill="x", pady=10)
+
+        scan_frame = ttk.Frame(top)
+        scan_frame.pack(fill="x")
+        self.gdrive_scan_btn = ttk.Button(
+            scan_frame, text="Scan Google Drive for Duplicates", command=self._start_gdrive_scan, state="disabled"
+        )
+        self.gdrive_scan_btn.pack(side="left")
+        self.gdrive_cancel_btn = ttk.Button(
+            scan_frame, text="Cancel", command=self._cancel_gdrive_scan, state="disabled"
+        )
+        self.gdrive_cancel_btn.pack(side="left", padx=10)
+
+        self.gdrive_summary_var = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.gdrive_summary_var, font=("", 11, "bold")).pack(anchor="w", pady=(8, 0))
+
+        mid = ttk.Frame(parent, padding=(10, 0, 10, 10))
+        mid.pack(fill="both", expand=True)
+
+        self.gdrive_tree = ttk.Treeview(
+            mid, columns=("name", "size"), show="tree headings", selectmode="extended"
+        )
+        self.gdrive_tree.heading("#0", text="Duplicate Group")
+        self.gdrive_tree.heading("name", text="File Name")
+        self.gdrive_tree.heading("size", text="Size")
+        self.gdrive_tree.column("#0", width=320)
+        self.gdrive_tree.column("name", width=460)
+        self.gdrive_tree.column("size", width=100, anchor="e")
+        self.gdrive_tree.pack(side="left", fill="both", expand=True)
+
+        gdrive_scrollbar = ttk.Scrollbar(mid, orient="vertical", command=self.gdrive_tree.yview)
+        gdrive_scrollbar.pack(side="right", fill="y")
+        self.gdrive_tree.configure(yscrollcommand=gdrive_scrollbar.set)
+
+        bottom = ttk.Frame(parent, padding=10)
+        bottom.pack(fill="x")
+        ttk.Button(bottom, text="View in Google Drive", command=self._view_gdrive_selected).pack(side="left")
+        ttk.Button(
+            bottom, text="Move Selected to Drive Trash", command=self._delete_selected_gdrive
+        ).pack(side="left", padx=10)
+
+        self._update_gdrive_status()
+
+    def _connect_google_drive(self):
+        if not GOOGLE_AVAILABLE:
+            messagebox.showerror(
+                "Google API packages not installed",
+                "Run: pip3 install google-api-python-client google-auth-oauthlib google-auth-httplib2\n"
+                "Then restart the app."
+            )
+            return
+        if not GOOGLE_CLIENT_SECRET_PATH.exists():
+            messagebox.showerror(
+                "Missing Google OAuth client",
+                f"Expected the downloaded OAuth client file at:\n{GOOGLE_CLIENT_SECRET_PATH}"
+            )
+            return
+
+        self.gdrive_connect_btn.config(state="disabled")
+        self.gdrive_status_var.set("Waiting for Google sign-in in your browser...")
+
+        def worker():
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file(str(GOOGLE_CLIENT_SECRET_PATH), GOOGLE_SCOPES)
+                creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+            except Exception as e:
+                self.gdrive_queue.put(("connect_error", str(e)))
+                return
+            self.gdrive_queue.put(("connect_done", creds.refresh_token))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _disconnect_google_drive(self):
+        confirm = messagebox.askyesno(
+            "Disconnect Google Drive", "Remove the stored Google Drive connection from this app?"
+        )
+        if not confirm:
+            return
+        self.config_data.pop("google_refresh_token", None)
+        save_config(self.config_data)
+        self.gdrive_dup_groups = []
+        self.gdrive_tree.delete(*self.gdrive_tree.get_children())
+        self.gdrive_item_info = {}
+        self.gdrive_summary_var.set("")
+        self._update_gdrive_status()
+
+    def _update_gdrive_status(self):
+        service = make_google_drive_service(self.config_data)
+        if service is None:
+            self.gdrive_status_var.set("Not connected.")
+            self.gdrive_connect_btn.config(text="Connect Google Drive...", state="normal")
+            self.gdrive_scan_btn.config(state="disabled")
+            self.gdrive_disconnect_btn.config(state="disabled")
+            return
+
+        self.gdrive_scan_btn.config(state="normal")
+        self.gdrive_disconnect_btn.config(state="normal")
+        self.gdrive_connect_btn.config(text="Reconnect Google Drive...", state="normal")
+        self.gdrive_status_var.set("Connected — checking account...")
+
+        def worker():
+            try:
+                about = service.about().get(fields="user").execute()
+                email = about.get("user", {}).get("emailAddress", "unknown")
+                self.gdrive_queue.put(("account", email))
+            except Exception as e:
+                self.gdrive_queue.put(("account_error", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_gdrive_scan(self):
+        creds = make_google_credentials(self.config_data)
+        if creds is None:
+            messagebox.showwarning("Not connected", "Connect your Google Drive account first.")
+            return
+        service = google_build("drive", "v3", credentials=creds, cache_discovery=False)
+
+        self.gdrive_stop_flag.clear()
+        self.gdrive_scan_btn.config(state="disabled")
+        self.gdrive_cancel_btn.config(state="normal")
+        self.gdrive_status_var.set("Scanning Google Drive... this can take a while for large accounts.")
+        self.gdrive_tree.delete(*self.gdrive_tree.get_children())
+        self.gdrive_item_info = {}
+        self._gdrive_thumb_refs.clear()
+        self.gdrive_summary_var.set("")
+
+        def progress(msg):
+            self.gdrive_queue.put(("progress", msg))
+
+        def worker():
+            result = find_google_drive_duplicates(service, progress_cb=progress, stop_flag=self.gdrive_stop_flag)
+            if result is not None:
+                dup_groups, total_listed = result
+                dup_groups = attach_google_drive_thumbnails(
+                    creds, dup_groups, progress_cb=progress, stop_flag=self.gdrive_stop_flag
+                )
+                result = None if dup_groups is None else (dup_groups, total_listed)
+            self.gdrive_queue.put(("scan_done", result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cancel_gdrive_scan(self):
+        self.gdrive_stop_flag.set()
+        self.gdrive_status_var.set("Cancelling...")
+
+    def _poll_gdrive_queue(self):
+        try:
+            while True:
+                kind, payload = self.gdrive_queue.get_nowait()
+                if kind == "progress":
+                    self.gdrive_status_var.set(payload)
+                elif kind == "scan_done":
+                    self._on_gdrive_scan_done(payload)
+                elif kind == "account":
+                    self.gdrive_status_var.set(f"Connected as {payload}.")
+                elif kind == "account_error":
+                    self.gdrive_status_var.set(f"Connected, but couldn't verify account: {payload}")
+                elif kind == "connect_done":
+                    self.gdrive_connect_btn.config(state="normal")
+                    refresh_token = payload
+                    if refresh_token:
+                        self.config_data["google_refresh_token"] = refresh_token
+                        save_config(self.config_data)
+                        self._update_gdrive_status()
+                    else:
+                        self.gdrive_status_var.set(
+                            "Connected, but Google didn't return a refresh token — try Disconnect then "
+                            "Connect again."
+                        )
+                elif kind == "connect_error":
+                    self.gdrive_connect_btn.config(state="normal")
+                    self.gdrive_status_var.set(f"Connection failed: {payload}")
+                elif kind == "delete_done":
+                    self._on_gdrive_delete_done(payload)
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_gdrive_queue)
+
+    def _on_gdrive_scan_done(self, result):
+        self.gdrive_scan_btn.config(state="normal")
+        self.gdrive_cancel_btn.config(state="disabled")
+        if result is None:
+            self.gdrive_status_var.set("Scan cancelled.")
+            return
+
+        dup_groups, total_listed = result
+        self.gdrive_dup_groups = dup_groups
+        total_wasted = sum(g["wasted"] for g in dup_groups)
+        self.gdrive_status_var.set(f"Scan complete — {total_listed} files with checksums listed.")
+        self.gdrive_summary_var.set(
+            f"{len(dup_groups)} duplicate groups found — {human_size(total_wasted)} of wasted space"
+        )
+
+        for group in dup_groups:
+            label = (
+                f"{human_size(group['size'])} x {len(group['files'])} copies "
+                f"— wastes {human_size(group['wasted'])}"
+            )
+            group_id = self.gdrive_tree.insert("", "end", text=label, open=False, tags=("group",))
+            for file_id, name, thumb_bytes in group["files"]:
+                kwargs = dict(text="", values=(name, human_size(group["size"])), tags=("file",))
+                if thumb_bytes is not None:
+                    try:
+                        thumb = ImageTk.PhotoImage(Image.open(io.BytesIO(thumb_bytes)))
+                        self._gdrive_thumb_refs.append(thumb)
+                        kwargs["image"] = thumb
+                    except Exception:
+                        pass
+                item = self.gdrive_tree.insert(group_id, "end", **kwargs)
+                self.gdrive_item_info[item] = (file_id, name)
+
+    def _get_selected_gdrive_files(self):
+        return [
+            self.gdrive_item_info[item]
+            for item in self.gdrive_tree.selection()
+            if item in self.gdrive_item_info
+        ]
+
+    def _view_gdrive_selected(self):
+        items = self._get_selected_gdrive_files()
+        if not items:
+            messagebox.showinfo("Nothing selected", "Select one or more files first.")
+            return
+        for file_id, _name in items[:10]:
+            webbrowser.open(f"https://drive.google.com/file/d/{file_id}/view")
+
+    def _delete_selected_gdrive(self):
+        items = self._get_selected_gdrive_files()
+        if not items:
+            messagebox.showinfo("Nothing selected", "Select one or more duplicate files to move to Trash.")
+            return
+        service = make_google_drive_service(self.config_data)
+        if service is None:
+            messagebox.showwarning("Not connected", "Connect your Google Drive account first.")
+            return
+        confirm = messagebox.askyesno(
+            "Confirm",
+            f"Move {len(items)} file(s) to Google Drive's Trash?\n\n"
+            f"This is recoverable from drive.google.com for 30 days, after which Drive deletes it "
+            f"permanently."
+        )
+        if not confirm:
+            return
+
+        item_by_file_id = {
+            file_id: item
+            for item, (file_id, _name) in self.gdrive_item_info.items()
+        }
+        self.gdrive_status_var.set(f"Moving {len(items)} file(s) to Google Drive Trash...")
+
+        def worker():
+            errors = []
+            succeeded = []
+            for file_id, name in items:
+                try:
+                    service.files().update(fileId=file_id, body={"trashed": True}).execute()
+                    succeeded.append(item_by_file_id.get(file_id))
+                except Exception as e:
+                    errors.append(f"{name}: {e}")
+            self.gdrive_queue.put(("delete_done", (succeeded, errors)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_gdrive_delete_done(self, payload):
+        succeeded, errors = payload
+        for item in succeeded:
+            if item and self.gdrive_tree.exists(item):
+                self.gdrive_tree.delete(item)
+            self.gdrive_item_info.pop(item, None)
+
+        self.gdrive_status_var.set(f"Moved {len(succeeded)} file(s) to Google Drive Trash.")
+        if errors:
+            messagebox.showerror("Some files failed", "\n".join(errors[:10]))
 
 
 if __name__ == "__main__":

@@ -47,12 +47,19 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Launcher executable: find a Python with tkinter, then run the bundled script.
-cat > "$MACOS/launcher" <<'LAUNCHER'
+# Launcher executable: prefer this project's venv (has tkinter + the dropbox/
+# google API packages the app needs, and Apple's system Tk is known to render
+# ttk widgets as a blank window on modern macOS). Falls back to searching for
+# any Python with tkinter if the venv isn't there.
+cat > "$MACOS/launcher" <<LAUNCHER
 #!/bin/bash
-DIR="$(cd "$(dirname "$0")" && pwd)"
-RES="$DIR/../Resources"
+DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+RES="\$DIR/../Resources"
 export CDF_BUNDLED=1
+VENV_PY="$PROJECT_DIR/.venv/bin/python3"
+if [ -x "\$VENV_PY" ]; then
+  exec "\$VENV_PY" "\$RES/cloud_duplicate_finder.py"
+fi
 CANDIDATES=(
   /opt/homebrew/bin/python3.13
   /opt/homebrew/bin/python3.12
@@ -61,9 +68,9 @@ CANDIDATES=(
   /usr/local/bin/python3
   /usr/bin/python3
 )
-for PY in "${CANDIDATES[@]}"; do
-  if [ -x "$PY" ] && "$PY" -c "import tkinter" >/dev/null 2>&1; then
-    exec "$PY" "$RES/cloud_duplicate_finder.py"
+for PY in "\${CANDIDATES[@]}"; do
+  if [ -x "\$PY" ] && "\$PY" -c "import tkinter" >/dev/null 2>&1; then
+    exec "\$PY" "\$RES/cloud_duplicate_finder.py"
   fi
 done
 /usr/bin/osascript -e 'display alert "Cloud Duplicate Finder" message "No Python with tkinter was found.\n\nInstall it with:\n    brew install python-tk@3.13"'
