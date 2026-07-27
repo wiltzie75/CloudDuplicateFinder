@@ -665,6 +665,20 @@ def run_cross_reference(cloud_paths, catalog_paths, progress_cb=None, stop_flag=
 # GUI
 # ---------------------------------------------------------------------------
 
+PALETTE = {
+    "window_bg": "#ECECEC",
+    "fg": "#1D1D1F",
+    "muted_fg": "#6E6E73",
+    "accent": "#007AFF",
+    "accent_fg": "#FFFFFF",
+    "accent_disabled": "#B7D6FF",
+    "border": "#D6D6D8",
+    "tree_bg": "#FFFFFF",
+    "tree_group_bg": "#E8F0FE",
+    "select_bg": "#CCE4FF",
+}
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -698,22 +712,27 @@ class App(tk.Tk):
         self.gdrive_item_info = {}
         self._gdrive_thumb_refs = []  # keep PhotoImage references alive
 
-        style = ttk.Style(self)
+        self.style = ttk.Style(self)
         # Prefer macOS's native 'aqua' theme, but only when running as a bundled
         # .app (the launcher sets CDF_BUNDLED=1). As a loose script, aqua's
         # native buttons can be unresponsive to clicks because the process isn't
         # activated as a real app, so we fall back to 'clam' for reliability.
+        # 'clam' also gives us full control over colors, which is what powers
+        # the custom palette below (aqua ignores custom widget colors).
         bundled = os.environ.get("CDF_BUNDLED") == "1"
         tk_major = int(self.tk.call("info", "patchlevel").split(".")[0])
-        if bundled and tk_major >= 9 and "aqua" in style.theme_names():
-            theme = "aqua"
+        if bundled and tk_major >= 9 and "aqua" in self.style.theme_names():
+            self._theme = "aqua"
         else:
-            theme = "clam"
+            self._theme = "clam"
         try:
-            style.theme_use(theme)
+            self.style.theme_use(self._theme)
         except tk.TclError:
             pass
-        style.configure("Treeview", rowheight=56)
+
+        self._trees = []
+        self.palette = PALETTE
+        self._apply_palette()
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True)
@@ -722,10 +741,10 @@ class App(tk.Tk):
         tab_c1 = ttk.Frame(notebook)
         tab_dbx = ttk.Frame(notebook)
         tab_gdrive = ttk.Frame(notebook)
-        notebook.add(tab_dup, text="Duplicate Finder")
-        notebook.add(tab_c1, text="Capture One Cross-Reference")
-        notebook.add(tab_dbx, text="Dropbox (Online)")
-        notebook.add(tab_gdrive, text="Google Drive (Online)")
+        notebook.add(tab_dup, text="🔍  Duplicate Finder")
+        notebook.add(tab_c1, text="🖼️  Capture One Cross-Reference")
+        notebook.add(tab_dbx, text="📦  Dropbox (Online)")
+        notebook.add(tab_gdrive, text="🗂️  Google Drive (Online)")
 
         self._build_dup_tab(tab_dup)
         self._build_c1_tab(tab_c1)
@@ -737,6 +756,57 @@ class App(tk.Tk):
         self.after(150, self._poll_c1_queue)
         self.after(150, self._poll_dbx_queue)
         self.after(150, self._poll_gdrive_queue)
+
+    # ---- appearance / theming ---------------------------------------------
+
+    def _register_tree(self, tree):
+        """Track a Treeview so its row-tag colors get updated on theme changes."""
+        self._trees.append(tree)
+        self._style_tree_tags(tree)
+
+    def _style_tree_tags(self, tree):
+        p = self.palette
+        tree.tag_configure("group", background=p["tree_group_bg"], font=("", 11, "bold"))
+        tree.tag_configure("file", background=p["tree_bg"])
+
+    def _apply_palette(self):
+        p = self.palette
+        style = self.style
+        self.configure(background=p["window_bg"])
+        style.configure(".", background=p["window_bg"], foreground=p["fg"])
+        style.configure("TFrame", background=p["window_bg"])
+        style.configure("TLabel", background=p["window_bg"], foreground=p["fg"])
+        style.configure("Heading.TLabel", font=("", 13, "bold"))
+        style.configure("Muted.TLabel", foreground=p["muted_fg"])
+        style.configure("Badge.TLabel", foreground=p["accent"], font=("", 11, "bold"))
+        style.configure("TCheckbutton", background=p["window_bg"], foreground=p["fg"])
+        style.configure("TSeparator", background=p["border"])
+
+        style.configure("TButton", padding=(10, 6))
+        style.configure("Accent.TButton", padding=(12, 7), font=("", 11, "bold"))
+        style.map(
+            "Accent.TButton",
+            background=[("disabled", p["accent_disabled"]), ("!disabled", p["accent"])],
+            foreground=[("disabled", p["accent_fg"]), ("!disabled", p["accent_fg"])],
+        )
+
+        style.configure("TNotebook", background=p["window_bg"], borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(14, 8), font=("", 11))
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", p["tree_bg"]), ("!selected", p["window_bg"])],
+            foreground=[("selected", p["accent"]), ("!selected", p["fg"])],
+        )
+
+        style.configure(
+            "Treeview", background=p["tree_bg"], fieldbackground=p["tree_bg"],
+            foreground=p["fg"], rowheight=56, borderwidth=0,
+        )
+        style.configure(
+            "Treeview.Heading", font=("", 11, "bold"),
+            background=p["window_bg"], foreground=p["fg"],
+        )
+        style.map("Treeview", background=[("selected", p["select_bg"])])
 
     # ---- native macOS menu bar -------------------------------------------
 
@@ -838,12 +908,12 @@ class App(tk.Tk):
     # =======================================================================
 
     def _build_dup_tab(self, parent):
-        top = ttk.Frame(parent, padding=10)
+        top = ttk.Frame(parent, padding=(16, 14))
         top.pack(fill="x")
 
-        ttk.Label(top, text="Detected locations", font=("", 12, "bold")).pack(anchor="w")
+        ttk.Label(top, text="📍 Detected locations", style="Heading.TLabel").pack(anchor="w")
         ttk.Label(
-            top, text="Scans only .heic, .jpg, .jpeg, and .png files.", foreground="gray"
+            top, text="Scans only .heic, .jpg, .jpeg, and .png files.", style="Muted.TLabel"
         ).pack(anchor="w")
 
         services_frame = ttk.Frame(top)
@@ -863,25 +933,27 @@ class App(tk.Tk):
         btn_frame = ttk.Frame(top)
         btn_frame.pack(fill="x", pady=(8, 0))
         ttk.Button(btn_frame, text="Add Custom Folder...", command=self._add_custom).pack(side="left")
-        self.scan_btn = ttk.Button(btn_frame, text="Scan for Duplicates", command=self._start_scan)
+        self.scan_btn = ttk.Button(
+            btn_frame, text="Scan for Duplicates", command=self._start_scan, style="Accent.TButton"
+        )
         self.scan_btn.pack(side="left", padx=10)
         self.cancel_btn = ttk.Button(btn_frame, text="Cancel", command=self._cancel_scan, state="disabled")
         self.cancel_btn.pack(side="left")
 
         self.status_var = tk.StringVar(value="Ready. Select services above, then Scan.")
-        ttk.Label(top, textvariable=self.status_var).pack(anchor="w", pady=(8, 0))
+        ttk.Label(top, textvariable=self.status_var, style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
 
         self.summary_var = tk.StringVar(value="")
-        ttk.Label(top, textvariable=self.summary_var, font=("", 11, "bold")).pack(anchor="w")
+        ttk.Label(top, textvariable=self.summary_var, style="Badge.TLabel").pack(anchor="w")
 
         if not PIL_AVAILABLE:
             ttk.Label(
                 top,
                 text="Tip: run 'pip3 install pillow pillow-heif' to see image thumbnails here.",
-                foreground="gray",
+                style="Muted.TLabel",
             ).pack(anchor="w", pady=(2, 0))
 
-        mid = ttk.Frame(parent, padding=(10, 0, 10, 10))
+        mid = ttk.Frame(parent, padding=(16, 0, 16, 14))
         mid.pack(fill="both", expand=True)
 
         self.tree = ttk.Treeview(
@@ -900,8 +972,9 @@ class App(tk.Tk):
         self.tree.configure(yscrollcommand=scrollbar.set)
 
         self._bind_context_menu(self.tree, include_original=True)
+        self._register_tree(self.tree)
 
-        bottom = ttk.Frame(parent, padding=10)
+        bottom = ttk.Frame(parent, padding=(16, 10))
         bottom.pack(fill="x")
         ttk.Button(bottom, text="Reveal in Finder",
                    command=lambda: self._reveal(self._get_selected_files(self.tree))).pack(side="left")
@@ -1045,17 +1118,17 @@ class App(tk.Tk):
     # =======================================================================
 
     def _build_c1_tab(self, parent):
-        top = ttk.Frame(parent, padding=10)
+        top = ttk.Frame(parent, padding=(16, 14))
         top.pack(fill="x")
 
         ttk.Label(
-            top, text="Step 1 — Find your Capture One catalog(s)",
-            font=("", 12, "bold")
+            top, text="① Find your Capture One catalog(s)",
+            style="Heading.TLabel"
         ).pack(anchor="w")
         ttk.Label(
             top,
             text="Searches ~/Pictures, ~/Documents, ~/Desktop, and your detected cloud folders for .cocatalog files.",
-            foreground="gray"
+            style="Muted.TLabel"
         ).pack(anchor="w")
 
         cat_btn_frame = ttk.Frame(top)
@@ -1071,8 +1144,8 @@ class App(tk.Tk):
         ttk.Separator(top).pack(fill="x", pady=10)
 
         ttk.Label(
-            top, text="Step 2 — Choose cloud folders to check, then cross-reference",
-            font=("", 12, "bold")
+            top, text="② Choose cloud folders to check, then cross-reference",
+            style="Heading.TLabel"
         ).pack(anchor="w")
 
         c1_services_frame = ttk.Frame(top)
@@ -1091,7 +1164,8 @@ class App(tk.Tk):
         c1_btn_frame = ttk.Frame(top)
         c1_btn_frame.pack(fill="x", pady=(4, 0))
         self.c1_scan_btn = ttk.Button(
-            c1_btn_frame, text="Cross-Reference Now", command=self._start_cross_reference
+            c1_btn_frame, text="Cross-Reference Now", command=self._start_cross_reference,
+            style="Accent.TButton"
         )
         self.c1_scan_btn.pack(side="left")
         self.c1_cancel_btn = ttk.Button(
@@ -1100,19 +1174,19 @@ class App(tk.Tk):
         self.c1_cancel_btn.pack(side="left", padx=10)
 
         self.c1_status_var = tk.StringVar(value="Find your catalog(s) first, then cross-reference.")
-        ttk.Label(top, textvariable=self.c1_status_var).pack(anchor="w", pady=(8, 0))
+        ttk.Label(top, textvariable=self.c1_status_var, style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
 
         self.c1_summary_var = tk.StringVar(value="")
-        ttk.Label(top, textvariable=self.c1_summary_var, font=("", 11, "bold")).pack(anchor="w")
+        ttk.Label(top, textvariable=self.c1_summary_var, style="Badge.TLabel").pack(anchor="w")
 
         ttk.Label(
             top,
             text=("Note: matching is by filename, not photo content. Two different photos that happen to "
                   "share an identical filename could show as a false match."),
-            foreground="gray", wraplength=900, justify="left"
+            style="Muted.TLabel", wraplength=900, justify="left"
         ).pack(anchor="w", pady=(4, 0))
 
-        mid = ttk.Frame(parent, padding=(10, 0, 10, 10))
+        mid = ttk.Frame(parent, padding=(16, 0, 16, 14))
         mid.pack(fill="both", expand=True)
 
         self.c1_tree = ttk.Treeview(
@@ -1131,8 +1205,9 @@ class App(tk.Tk):
         self.c1_tree.configure(yscrollcommand=c1_scrollbar.set)
 
         self._bind_context_menu(self.c1_tree)
+        self._register_tree(self.c1_tree)
 
-        bottom = ttk.Frame(parent, padding=10)
+        bottom = ttk.Frame(parent, padding=(16, 10))
         bottom.pack(fill="x")
         ttk.Button(bottom, text="Reveal in Finder",
                    command=lambda: self._reveal(self._get_selected_files(self.c1_tree))).pack(side="left")
@@ -1173,7 +1248,7 @@ class App(tk.Tk):
         self.catalog_vars = {}
 
         if not catalogs:
-            ttk.Label(self.catalog_list_frame, text="No catalogs found.", foreground="gray").pack(anchor="w")
+            ttk.Label(self.catalog_list_frame, text="No catalogs found.", style="Muted.TLabel").pack(anchor="w")
             return
 
         for cat in catalogs:
@@ -1339,31 +1414,31 @@ class App(tk.Tk):
     # =======================================================================
 
     def _build_dropbox_tab(self, parent):
-        top = ttk.Frame(parent, padding=10)
+        top = ttk.Frame(parent, padding=(16, 14))
         top.pack(fill="x")
 
         ttk.Label(
-            top, text="Connect your Dropbox account", font=("", 12, "bold")
+            top, text="📦 Connect your Dropbox account", style="Heading.TLabel"
         ).pack(anchor="w")
         ttk.Label(
             top,
             text=("Scans your entire Dropbox online for .jpg, .jpeg, .heic, and .png files, including "
                   "files not synced to this Mac. Duplicates are found using Dropbox's own content hash, "
                   "so nothing is downloaded."),
-            foreground="gray", wraplength=900, justify="left"
+            style="Muted.TLabel", wraplength=900, justify="left"
         ).pack(anchor="w")
 
         if not DROPBOX_AVAILABLE:
             ttk.Label(
                 top,
                 text="Requires the 'dropbox' package. Run: pip3 install dropbox — then restart the app.",
-                foreground="gray"
+                style="Muted.TLabel"
             ).pack(anchor="w", pady=(4, 0))
 
         conn_frame = ttk.Frame(top)
         conn_frame.pack(fill="x", pady=(8, 0))
         self.dbx_connect_btn = ttk.Button(
-            conn_frame, text="Connect Dropbox...", command=self._connect_dropbox
+            conn_frame, text="Connect Dropbox...", command=self._connect_dropbox, style="Accent.TButton"
         )
         self.dbx_connect_btn.pack(side="left")
         self.dbx_disconnect_btn = ttk.Button(
@@ -1372,14 +1447,15 @@ class App(tk.Tk):
         self.dbx_disconnect_btn.pack(side="left", padx=10)
 
         self.dbx_status_var = tk.StringVar(value="Not connected.")
-        ttk.Label(top, textvariable=self.dbx_status_var).pack(anchor="w", pady=(8, 0))
+        ttk.Label(top, textvariable=self.dbx_status_var, style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
 
         ttk.Separator(top).pack(fill="x", pady=10)
 
         scan_frame = ttk.Frame(top)
         scan_frame.pack(fill="x")
         self.dbx_scan_btn = ttk.Button(
-            scan_frame, text="Scan Dropbox for Duplicates", command=self._start_dropbox_scan, state="disabled"
+            scan_frame, text="Scan Dropbox for Duplicates", command=self._start_dropbox_scan, state="disabled",
+            style="Accent.TButton"
         )
         self.dbx_scan_btn.pack(side="left")
         self.dbx_cancel_btn = ttk.Button(
@@ -1388,9 +1464,9 @@ class App(tk.Tk):
         self.dbx_cancel_btn.pack(side="left", padx=10)
 
         self.dbx_summary_var = tk.StringVar(value="")
-        ttk.Label(top, textvariable=self.dbx_summary_var, font=("", 11, "bold")).pack(anchor="w", pady=(8, 0))
+        ttk.Label(top, textvariable=self.dbx_summary_var, style="Badge.TLabel").pack(anchor="w", pady=(8, 0))
 
-        mid = ttk.Frame(parent, padding=(10, 0, 10, 10))
+        mid = ttk.Frame(parent, padding=(16, 0, 16, 14))
         mid.pack(fill="both", expand=True)
 
         self.dbx_tree = ttk.Treeview(
@@ -1407,8 +1483,9 @@ class App(tk.Tk):
         dbx_scrollbar = ttk.Scrollbar(mid, orient="vertical", command=self.dbx_tree.yview)
         dbx_scrollbar.pack(side="right", fill="y")
         self.dbx_tree.configure(yscrollcommand=dbx_scrollbar.set)
+        self._register_tree(self.dbx_tree)
 
-        bottom = ttk.Frame(parent, padding=10)
+        bottom = ttk.Frame(parent, padding=(16, 10))
         bottom.pack(fill="x")
         ttk.Button(
             bottom, text="View in Dropbox.com",
@@ -1636,18 +1713,18 @@ class App(tk.Tk):
     # =======================================================================
 
     def _build_gdrive_tab(self, parent):
-        top = ttk.Frame(parent, padding=10)
+        top = ttk.Frame(parent, padding=(16, 14))
         top.pack(fill="x")
 
         ttk.Label(
-            top, text="Connect your Google Drive account", font=("", 12, "bold")
+            top, text="🗂️ Connect your Google Drive account", style="Heading.TLabel"
         ).pack(anchor="w")
         ttk.Label(
             top,
             text=("Scans your entire Drive online for .jpg, .jpeg, .heic, and .png files, including files "
                   "not synced to this Mac. Duplicates are found using Google's own file checksum — full "
                   "files aren't downloaded, only small thumbnail previews for files with duplicates."),
-            foreground="gray", wraplength=900, justify="left"
+            style="Muted.TLabel", wraplength=900, justify="left"
         ).pack(anchor="w")
 
         if not GOOGLE_AVAILABLE:
@@ -1655,20 +1732,21 @@ class App(tk.Tk):
                 top,
                 text=("Requires the Google API packages. Run: pip3 install google-api-python-client "
                       "google-auth-oauthlib google-auth-httplib2 — then restart the app."),
-                foreground="gray"
+                style="Muted.TLabel"
             ).pack(anchor="w", pady=(4, 0))
         elif not GOOGLE_CLIENT_SECRET_PATH.exists():
             ttk.Label(
                 top,
                 text=(f"Missing OAuth client file. Download it from Google Cloud Console "
                       f"(APIs & Services -> Credentials) and save it as:\n{GOOGLE_CLIENT_SECRET_PATH}"),
-                foreground="gray", wraplength=900, justify="left"
+                style="Muted.TLabel", wraplength=900, justify="left"
             ).pack(anchor="w", pady=(4, 0))
 
         conn_frame = ttk.Frame(top)
         conn_frame.pack(fill="x", pady=(8, 0))
         self.gdrive_connect_btn = ttk.Button(
-            conn_frame, text="Connect Google Drive...", command=self._connect_google_drive
+            conn_frame, text="Connect Google Drive...", command=self._connect_google_drive,
+            style="Accent.TButton"
         )
         self.gdrive_connect_btn.pack(side="left")
         self.gdrive_disconnect_btn = ttk.Button(
@@ -1677,14 +1755,15 @@ class App(tk.Tk):
         self.gdrive_disconnect_btn.pack(side="left", padx=10)
 
         self.gdrive_status_var = tk.StringVar(value="Not connected.")
-        ttk.Label(top, textvariable=self.gdrive_status_var).pack(anchor="w", pady=(8, 0))
+        ttk.Label(top, textvariable=self.gdrive_status_var, style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
 
         ttk.Separator(top).pack(fill="x", pady=10)
 
         scan_frame = ttk.Frame(top)
         scan_frame.pack(fill="x")
         self.gdrive_scan_btn = ttk.Button(
-            scan_frame, text="Scan Google Drive for Duplicates", command=self._start_gdrive_scan, state="disabled"
+            scan_frame, text="Scan Google Drive for Duplicates", command=self._start_gdrive_scan, state="disabled",
+            style="Accent.TButton"
         )
         self.gdrive_scan_btn.pack(side="left")
         self.gdrive_cancel_btn = ttk.Button(
@@ -1693,9 +1772,9 @@ class App(tk.Tk):
         self.gdrive_cancel_btn.pack(side="left", padx=10)
 
         self.gdrive_summary_var = tk.StringVar(value="")
-        ttk.Label(top, textvariable=self.gdrive_summary_var, font=("", 11, "bold")).pack(anchor="w", pady=(8, 0))
+        ttk.Label(top, textvariable=self.gdrive_summary_var, style="Badge.TLabel").pack(anchor="w", pady=(8, 0))
 
-        mid = ttk.Frame(parent, padding=(10, 0, 10, 10))
+        mid = ttk.Frame(parent, padding=(16, 0, 16, 14))
         mid.pack(fill="both", expand=True)
 
         self.gdrive_tree = ttk.Treeview(
@@ -1712,8 +1791,9 @@ class App(tk.Tk):
         gdrive_scrollbar = ttk.Scrollbar(mid, orient="vertical", command=self.gdrive_tree.yview)
         gdrive_scrollbar.pack(side="right", fill="y")
         self.gdrive_tree.configure(yscrollcommand=gdrive_scrollbar.set)
+        self._register_tree(self.gdrive_tree)
 
-        bottom = ttk.Frame(parent, padding=10)
+        bottom = ttk.Frame(parent, padding=(16, 10))
         bottom.pack(fill="x")
         ttk.Button(bottom, text="View in Google Drive", command=self._view_gdrive_selected).pack(side="left")
         ttk.Button(
